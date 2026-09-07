@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPX Splitter Web (WASM)</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+</head>
+<body>
+    <h1>GPX Splitter <small>WASM EDITION</small></h1>
+    
+    <div class="container">
+        <div class="sidebar">
+            <form id="splitter-form">
+                <div class="form-group">
+                    <label for="input-file">Input GPX (Route) *</label>
+                    <input type="file" id="input-file" accept=".gpx" required>
+                </div>
+
+                <div id="section-manual">
+                    <div class="form-group">
+                        <label for="p-flat">Flat Pace (MM:SS /km)</label>
+                        <input type="text" id="p-flat" value="05:00">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="hill-sensitivity">Hill Sensitivity: <span id="hill-sensitivity-val">1.0</span></label>
+                        <input type="range" id="hill-sensitivity" min="0.5" max="1.6" step="0.05" value="1.0">
+                        <p class="help-text">Scales the Minetti energy-cost model below. 1.0 follows it as-is; higher if hills hit you harder than average, lower if you're a strong climber / confident descender.</p>
+                    </div>
+
+                    <button type="button" id="apply-minetti-btn" class="btn-secondary">Auto-fill zones from flat pace</button>
+
+                    <details class="collapsible">
+                        <summary>Target Paces (MM:SS /km)</summary>
+                        <p class="help-text">Seeded from the Minetti model above; each zone stays editable, and paces are interpolated smoothly between zones rather than snapping at the boundaries.</p>
+                        <div class="pace-grid">
+                            <div class="form-group">
+                                <label>Very Steep Up (>10%)</label>
+                                <input type="text" id="p-vsteep-up" value="15:00">
+                            </div>
+                            <div class="form-group">
+                                <label>Very Steep Down (<-10%)</label>
+                                <input type="text" id="p-vsteep-down" value="06:30">
+                            </div>
+                            <div class="form-group">
+                                <label>Steep Up (6-10%)</label>
+                                <input type="text" id="p-steep-up" value="10:00">
+                            </div>
+                            <div class="form-group">
+                                <label>Steep Down (-6 to -10%)</label>
+                                <input type="text" id="p-steep-down" value="05:30">
+                            </div>
+                            <div class="form-group">
+                                <label>Moderate Up (3-6%)</label>
+                                <input type="text" id="p-mod-up" value="07:30">
+                            </div>
+                            <div class="form-group">
+                                <label>Moderate Down (-3 to -6%)</label>
+                                <input type="text" id="p-mod-down" value="05:00">
+                            </div>
+                            <div class="form-group">
+                                <label>Gentle Up (1-3%)</label>
+                                <input type="text" id="p-gentle-up" value="06:00">
+                            </div>
+                            <div class="form-group">
+                                <label>Gentle Down (-1 to -3%)</label>
+                                <input type="text" id="p-gentle-down" value="04:45">
+                            </div>
+                        </div>
+                    </details>
+
+                    <div class="form-group" style="margin-top: 1.25rem;">
+                        <label for="degradation-factor">Total Degradation: <span id="degrad-val">0</span>%</label>
+                        <input type="range" id="degradation-factor" min="0" max="100" step="1" value="0">
+                        <p class="help-text">Overall aerobic slowdown by the finish, applied across every gradient.</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="fatigue-exponent">Fatigue Shape: <span id="fatigue-val">2.0</span></label>
+                        <input type="range" id="fatigue-exponent" min="1.0" max="4.0" step="0.1" value="2.0">
+                        <p class="help-text">1.0 = Linear, 3.0+ = Late Crash. Default 2.0 (mild accelerating decline) reflects ultra-pacing studies (Lambert et al. 2004; Kerhervé et al. 2015) showing pace holds up early then drops off, rather than degrading in a straight line.</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="wall-onset">Wall Onset: <span id="wall-onset-val">68</span>%</label>
+                        <input type="range" id="wall-onset" min="5" max="95" step="5" value="68">
+                        <p class="help-text">Race progress where fatigue accelerates sharply, modelling glycogen-depletion "hitting the wall" rather than a smooth slowdown from km 0. Lower = crashes earlier. Default 68% sits between the classic marathon wall (~75% of distance) and the earlier decline onset seen in 100km+ ultra pacing studies.</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="downhill-degradation">Downhill Degradation: <span id="downhill-degrad-val">0</span>%</label>
+                        <input type="range" id="downhill-degradation" min="0" max="100" step="5" value="0">
+                        <p class="help-text">Extra slowdown on descents that builds through the race, on top of Total Degradation — models eccentric quad damage from repeated downhill pounding, independent of aerobic fatigue.</p>
+                    </div>
+                </div>
+
+                <hr style="margin: 1.5rem 0; border: 0; border-top: 1px solid #eee;">
+
+                <div class="form-group aid-stations-panel">
+                    <label>Aid Stations</label>
+                    <div class="aid-station-add">
+                        <input type="text" id="aid-name" placeholder="Name (e.g. Ravito 1)">
+                        <input type="number" id="aid-distance" step="0.1" min="0" placeholder="km">
+                        <button type="button" id="aid-add-btn" class="btn-secondary">Add</button>
+                    </div>
+                    <p class="help-text">Click the elevation chart to fill in a distance, or type it directly. Stations found in the GPX file's own waypoints are loaded automatically.</p>
+                    <ul id="aid-station-list" class="aid-station-list"></ul>
+                </div>
+
+                <hr style="margin: 1.5rem 0; border: 0; border-top: 1px solid #eee;">
+
+                <div class="form-group">
+                    <label for="tolerance">Tolerance (%)</label>
+                    <input type="number" id="tolerance" step="0.1" value="2.0">
+                </div>
+
+                <div class="form-group">
+                    <label for="min-distance">Min Distance (m)</label>
+                    <input type="number" id="min-distance" step="10" value="200">
+                </div>
+
+                <div class="buttons">
+                    <button type="button" id="download-btn" class="btn-primary">Download CSV</button>
+                </div>
+            </form>
+            <div id="status"></div>
+        </div>
+
+        <div class="main-content">
+            <div id="preview-section" class="preview-section hidden">
+                <h2>Route Preview</h2>
+                <div id="map"></div>
+                <div class="chart-wrapper">
+                    <canvas id="elevation-chart"></canvas>
+                    <div id="chart-tooltip" class="chart-tooltip hidden"></div>
+                </div>
+                <div id="chart-legend" class="chart-legend"></div>
+            </div>
+
+            <div id="results-container">
+                <div class="empty-state">
+                    Upload a GPX file to see the analysis grid
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>
