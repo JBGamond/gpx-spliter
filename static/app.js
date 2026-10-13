@@ -1072,12 +1072,12 @@ const renderNutritionResults = () => {
                 note = `moved ${deltaMin > 0 ? '+' : ''}${deltaMin} min to avoid slope`;
             }
             const grad = `${s.gradient_pct > 0 ? '+' : ''}${s.gradient_pct.toFixed(1)}`;
-            return `<tr>
+            return `<tr class="stop-row stop-row-${s.kind}">
                 <td>${i + 1}</td>
                 <td>${s.time}</td>
                 <td>${s.distance_km.toFixed(2)}</td>
                 <td>${grad}</td>
-                <td>${escapeHtml(s.name)}</td>
+                <td><span class="stop-dot nutrition-stop-${s.kind}"></span>${escapeHtml(s.name)}</td>
                 <td>${s.carbs_g.toFixed(0)}</td>
                 <td>${s.cumulative_carbs_g.toFixed(0)}</td>
                 <td>${note}</td>
@@ -1258,7 +1258,7 @@ const renderProductList = () => {
         return `
         <li data-id="${p.id}">
             <span class="aid-station-info">
-                <strong>${escapeHtml(p.name)}</strong>
+                <strong><span class="stop-dot nutrition-stop-${p.kind}"></span>${escapeHtml(p.name)}</strong>
                 <span class="aid-station-dist">${KIND_LABELS[p.kind]} &middot; ${detail} &middot; &times;${p.quantity}</span>
             </span>
             <button type="button" class="product-move-btn" data-id="${p.id}" data-dir="up" title="Move up">&uarr;</button>

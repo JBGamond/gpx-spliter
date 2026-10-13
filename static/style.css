@@ -456,6 +456,21 @@ tr:hover {
 .nutrition-stop-bar { background: #8e44ad; }
 .nutrition-stop-puree { background: #e67e22; }
 .nutrition-stop-marker.hard-slope { border-color: #e74c3c; }
+.nutrition-stop-drink { background: #3498db; }
+
+/* Same colors as the map markers, to find a stop in the table. */
+.stop-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-right: 0.45rem;
+    vertical-align: baseline;
+}
+
+.stop-row-gel td:first-child { box-shadow: inset 4px 0 0 #27ae60; }
+.stop-row-bar td:first-child { box-shadow: inset 4px 0 0 #8e44ad; }
+.stop-row-puree td:first-child { box-shadow: inset 4px 0 0 #e67e22; }
 
 /* Scroll only the table horizontally, not the whole main column (which would drag the map along). */
 .table-scroll {
