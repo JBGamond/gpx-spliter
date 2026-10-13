@@ -913,6 +913,7 @@ document.getElementById('apply-minetti-btn').onclick = () => {
         document.getElementById('p-vsteep-down').value = formatPaceInput(suggested.very_steep_downhill);
 
         runAnalysis();
+        savePrefs();
     } catch (e) {
         showStatus('Failed to compute suggested paces: ' + e, 'error');
     }
@@ -1214,6 +1215,7 @@ const redrawChart = () => {
 };
 
 const refreshNutrition = () => {
+    savePrefs();
     computeNutritionPlan();
     renderNutritionResults();
     renderNutritionMarkers();
@@ -1331,6 +1333,69 @@ document.getElementById('product-list').addEventListener('click', (evt) => {
     }
     renderProductList();
     refreshNutrition();
+});
+
+// ---- Saved settings --------------------------------------------------------
+//
+// Pacing/nutrition inputs and the product list are kept in localStorage so
+// they survive a reload. Aid stations depend on the route, so they aren't saved.
+
+const PREFS_KEY = 'gpx-splitter:prefs:v1';
+const PREF_INPUT_IDS = [
+    'p-flat', 'hill-sensitivity',
+    'p-vsteep-up', 'p-steep-up', 'p-mod-up', 'p-gentle-up',
+    'p-vsteep-down', 'p-steep-down', 'p-mod-down', 'p-gentle-down',
+    'degradation-factor', 'fatigue-exponent', 'wall-onset', 'downhill-degradation',
+    'tolerance', 'min-distance',
+    'carbs-per-hour', 'max-eat-uphill', 'max-eat-downhill', 'aid-window',
+];
+let prefsReady = false; // stays false while restoring, so half-loaded state isn't written back
+
+function savePrefs() {
+    if (!prefsReady) return;
+    const inputs = Object.fromEntries(PREF_INPUT_IDS.map(id => [id, document.getElementById(id).value]));
+    try {
+        localStorage.setItem(PREFS_KEY, JSON.stringify({ inputs, products: nutritionProducts }));
+    } catch (e) {
+        console.warn('Could not save settings:', e);
+    }
+}
+
+const isValidProduct = (p) => p && typeof p.id === 'string' && typeof p.name === 'string'
+    && p.kind in KIND_LABELS && p.carbs_g > 0 && p.quantity >= 1;
+
+const restorePrefs = () => {
+    try {
+        const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || 'null');
+        if (!saved) return;
+        PREF_INPUT_IDS.forEach(id => {
+            const value = saved.inputs && saved.inputs[id];
+            if (typeof value !== 'string') return;
+            const el = document.getElementById(id);
+            el.value = value;
+            el.dispatchEvent(new Event('input')); // refreshes slider labels
+        });
+        if (Array.isArray(saved.products)) {
+            nutritionProducts = saved.products.filter(isValidProduct).map(p => ({
+                id: p.id,
+                name: p.name,
+                kind: p.kind,
+                carbs_g: p.carbs_g,
+                quantity: p.quantity,
+                minutes_per_unit: p.minutes_per_unit > 0 ? p.minutes_per_unit : 0,
+                start_minutes: Number.isFinite(p.start_minutes) && p.start_minutes >= 0 ? p.start_minutes : null,
+            }));
+        }
+    } catch (e) {
+        console.warn('Could not restore saved settings:', e);
+    }
+};
+
+restorePrefs();
+prefsReady = true;
+['splitter-form', 'nutrition-form'].forEach(id => {
+    document.getElementById(id).addEventListener('input', savePrefs);
+    document.getElementById(id).addEventListener('change', savePrefs);
 });
 
 renderProductList();
