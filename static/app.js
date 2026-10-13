@@ -9,12 +9,17 @@ let hoverMarker = null;
 let chartLayout = null; // { totalKm, padLeft, padRight, width, height } from the last chart draw, for hover math
 let aidStations = []; // {id, name, lat, lon, elevation, distance_km, source: 'gpx'|'manual'}[]
 let aidMarkers = []; // maplibregl.Marker instances mirroring aidStations, in the same order
+let activeTab = 'pacing'; // 'pacing' | 'nutrition'
+let nutritionProducts = []; // {id, name, kind, carbs_g, quantity, minutes_per_unit, start_minutes}[] (in memory only)
+let nutritionPlan = null; // result of analyzer.plan_nutrition(), or null
+let nutritionMarkers = []; // maplibregl.Marker instances mirroring nutritionPlan.stops
 
 const status = document.getElementById('status');
 const resultsContainer = document.getElementById('results-container');
 const downloadBtn = document.getElementById('download-btn');
 const previewSection = document.getElementById('preview-section');
 const chartTooltip = document.getElementById('chart-tooltip');
+const nutritionContainer = document.getElementById('nutrition-container');
 
 async function start() {
     try {
@@ -326,6 +331,7 @@ const renderAidStations = () => {
 const removeAidStation = (id) => {
     aidStations = aidStations.filter(s => s.id !== id);
     renderAidStations();
+    refreshNutrition();
 };
 
 const addAidStation = (name, km) => {
@@ -342,6 +348,7 @@ const addAidStation = (name, km) => {
     });
     aidStations.sort((a, b) => a.distance_km - b.distance_km);
     renderAidStations();
+    refreshNutrition();
 };
 
 // Aid station markers on the elevation chart: a dashed vertical line plus a
@@ -438,6 +445,41 @@ const drawDistanceGrid = (ctx, xScale, totalKm, width, height, padLeft, padRight
     ctx.restore();
 };
 
+// ---- Nutrition overlays on the elevation chart ------------------------------
+
+// Shades every chunk steeper than the eating limits, so it's visible where
+// gel/bar stops were pushed away from.
+const drawNoEatZones = (ctx, xScale, chunks, top, bottom) => {
+    const { max_uphill_pct, max_downhill_pct } = getNutritionSettings();
+    ctx.save();
+    ctx.fillStyle = 'rgba(231, 76, 60, 0.12)';
+    chunks.forEach(c => {
+        if (c.gradient_pct > max_uphill_pct || c.gradient_pct < -max_downhill_pct) {
+            const x0 = xScale(c.cumulative_km - c.distance_km);
+            ctx.fillRect(x0, top, xScale(c.cumulative_km) - x0, bottom - top);
+        }
+    });
+    ctx.restore();
+};
+
+const drawNutritionStops = (ctx, xScale, yScale) => {
+    if (!nutritionPlan) return;
+    ctx.save();
+    nutritionPlan.stops.forEach(stop => {
+        const point = routePointAtDistance(stop.distance_km);
+        if (!point) return;
+        ctx.beginPath();
+        ctx.arc(xScale(stop.distance_km), yScale(point.elevation), 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = { bar: '#8e44ad', puree: '#e67e22' }[stop.kind] || '#27ae60';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = stop.on_hard_slope ? '#e74c3c' : 'white';
+        ctx.stroke();
+    });
+    ctx.restore();
+};
+
+
 const drawElevationChart = (points, chunks) => {
     const canvas = document.getElementById('elevation-chart');
     if (!canvas || points.length < 2 || chunks.length === 0) return;
@@ -477,6 +519,7 @@ const drawElevationChart = (points, chunks) => {
 
     drawElevationGrid(ctx, yScale, minEle, maxEle, width, padLeft, padRight);
     drawDistanceGrid(ctx, xScale, totalKm, width, height, padLeft, padRight, padTop, padBottom);
+    if (activeTab === 'nutrition') drawNoEatZones(ctx, xScale, chunks, padTop, height - padBottom);
 
     // Light fill under the curve for readability.
     ctx.beginPath();
@@ -502,6 +545,7 @@ const drawElevationChart = (points, chunks) => {
     }
 
     drawAidStationMarkers(ctx, xScale, padTop, height - padBottom, totalKm);
+    if (activeTab === 'nutrition') drawNutritionStops(ctx, xScale, yScale);
 };
 
 
@@ -695,6 +739,9 @@ const initAnalyzer = async () => {
         onChartHoverEnd();
         previewSection.classList.add('hidden');
         resultsContainer.innerHTML = '<div class="empty-state">Upload a GPX file to see the analysis grid</div>';
+        nutritionPlan = null;
+        clearNutritionMarkers();
+        renderNutritionResults();
         aidStations = [];
         renderAidStationList();
         clearAidMarkers();
@@ -733,6 +780,9 @@ const initAnalyzer = async () => {
             aidStations = [];
             renderAidStationList();
             clearAidMarkers();
+            nutritionPlan = null;
+            clearNutritionMarkers();
+            renderNutritionResults();
         }
 
         hideStatus();
@@ -740,6 +790,9 @@ const initAnalyzer = async () => {
     } catch (e) {
         showStatus('Error parsing files: ' + e, 'error');
         analyzer = null;
+        nutritionPlan = null;
+        clearNutritionMarkers();
+        renderNutritionResults();
     }
 };
 
@@ -771,6 +824,9 @@ const runAnalysis = () => {
             downhillDegradation
         );
         updateGrid(chunks);
+        computeNutritionPlan();
+        renderNutritionResults();
+        renderNutritionMarkers();
         try {
             updatePreview(chunks);
         } catch (previewError) {
@@ -913,6 +969,371 @@ document.getElementById('aid-station-list').addEventListener('click', (evt) => {
 });
 
 renderAidStationList();
+
+// ---- Nutrition planner -----------------------------------------------------
+//
+// Gel/bar stops are scheduled by the WASM planner over the paced race
+// timeline; drinks are sipped continuously and count toward the hourly goal.
+// The sidebar tab holds the inputs, the main panel the plan, and the map /
+// elevation chart overlay the stops while the Nutrition tab is active.
+
+const getNutritionSettings = () => {
+    const num = (id, fallback) => {
+        const v = parseFloat(document.getElementById(id).value);
+        return Number.isFinite(v) ? v : fallback;
+    };
+    return {
+        carbs_per_hour: num('carbs-per-hour', 60),
+        max_uphill_pct: num('max-eat-uphill', 8),
+        max_downhill_pct: num('max-eat-downhill', 5),
+        aid_window_minutes: num('aid-window', 15),
+        aid_stations: aidStations.map(({ name, distance_km }) => ({ name, distance_km })),
+        products: nutritionProducts.map(({ name, kind, carbs_g, quantity, minutes_per_unit, start_minutes }) => (
+            { name, kind, carbs_g, quantity, minutes_per_unit, start_minutes }
+        )),
+    };
+};
+
+const computeNutritionPlan = () => {
+    nutritionPlan = null;
+    if (!analyzer || !nutritionProducts.length) return;
+    const { tolerance, minDistance, manualPaces, degradationFactor, fatigueExponent, wallOnset, downhillDegradation } = getManualModelInputs();
+    try {
+        nutritionPlan = analyzer.plan_nutrition(
+            tolerance,
+            minDistance,
+            manualPaces,
+            degradationFactor,
+            fatigueExponent,
+            wallOnset,
+            downhillDegradation,
+            getNutritionSettings()
+        );
+    } catch (e) {
+        showStatus('Nutrition plan error: ' + e, 'error');
+    }
+};
+
+const renderNutritionResults = () => {
+    if (!analyzer) {
+        nutritionContainer.innerHTML = '<div class="empty-state">Upload a GPX file and add products to plan your nutrition</div>';
+        return;
+    }
+    if (!nutritionProducts.length) {
+        nutritionContainer.innerHTML = '<div class="empty-state">Add the gels, bars, purées and drinks you\'ll carry to build a plan</div>';
+        return;
+    }
+    if (!nutritionPlan) {
+        nutritionContainer.innerHTML = '';
+        return;
+    }
+
+    const plan = nutritionPlan;
+    const { carbs_per_hour } = getNutritionSettings();
+    const hardSlopeCount = plan.stops.filter(s => s.on_hard_slope).length;
+
+    const usageLines = plan.usage.map(u => {
+        const used = u.kind === 'drink'
+            ? `${u.used_units.toFixed(1)}/${u.carried} bottles`
+            : `${Math.round(u.used_units)}/${u.carried}`;
+        return `<p>${escapeHtml(u.name)}: ${used}</p>`;
+    }).join('');
+
+    let html = `<div class="nutrition-summary">
+        <p><strong>Race time: ${plan.total_time}</strong> &middot; Target: ${plan.target_carbs_g.toFixed(0)} g (${carbs_per_hour} g/h)</p>
+        <p>Planned: ${plan.planned_carbs_g.toFixed(0)} g (drinks ${plan.drink_carbs_g.toFixed(0)} g + solids ${plan.solid_carbs_g.toFixed(0)} g)</p>`;
+    if (plan.shortfall_g > 0.5) {
+        html += `<p class="nutrition-warning">Short by ${plan.shortfall_g.toFixed(0)} g: carry more products to hit your goal.</p>`;
+    }
+    if (hardSlopeCount) {
+        html += `<p class="nutrition-warning">${hardSlopeCount} stop(s) couldn't avoid a hard slope (&#9888;).</p>`;
+    }
+    html += `${usageLines}</div>`;
+    html += `<div class="nutrition-summary">
+        <p><strong>Carbs over time</strong></p>
+        <canvas id="carbs-chart"></canvas>
+        <p class="help-text">Blue: cumulative planned intake (drinks ramp up, solids step). Dashed: target at ${carbs_per_hour} g/h. Dots: gel/bar/purée stops.</p>
+    </div>`;
+
+    if (!plan.stops.length) {
+        html += '<div class="empty-state">No gel/bar stops needed before the finish</div>';
+    } else {
+        const rows = plan.stops.map((s, i) => {
+            const deltaMin = Math.round((s.time_secs - s.ideal_time_secs) / 60);
+            let note = '';
+            if (s.aid_station) {
+                note = `at ${escapeHtml(s.aid_station)}`;
+                if (Math.abs(s.time_secs - s.ideal_time_secs) >= 60) {
+                    note += ` (${deltaMin > 0 ? '+' : ''}${deltaMin} min)`;
+                }
+            } else if (s.on_hard_slope) {
+                note = '&#9888; hard slope';
+            } else if (Math.abs(s.time_secs - s.ideal_time_secs) >= 60) {
+                note = `moved ${deltaMin > 0 ? '+' : ''}${deltaMin} min to avoid slope`;
+            }
+            const grad = `${s.gradient_pct > 0 ? '+' : ''}${s.gradient_pct.toFixed(1)}`;
+            return `<tr>
+                <td>${i + 1}</td>
+                <td>${s.time}</td>
+                <td>${s.distance_km.toFixed(2)}</td>
+                <td>${grad}</td>
+                <td>${escapeHtml(s.name)}</td>
+                <td>${s.carbs_g.toFixed(0)}</td>
+                <td>${s.cumulative_carbs_g.toFixed(0)}</td>
+                <td>${note}</td>
+            </tr>`;
+        }).join('');
+        html += `<div class="table-scroll"><table>
+            <thead><tr><th>#</th><th>Time</th><th>Km</th><th>Grad %</th><th>Product</th><th>Carbs (g)</th><th>Total carbs (g)</th><th>Note</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table></div>`;
+    }
+    nutritionContainer.innerHTML = html;
+    drawCarbsChart();
+};
+
+// Cumulative planned carbs (drinks ramp, gels/bars/purées step) against the
+// straight-line target of carbs_per_hour, over race time.
+const drawCarbsChart = () => {
+    const canvas = document.getElementById('carbs-chart');
+    if (!canvas || !nutritionPlan || !nutritionPlan.curve.length) return;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width) return; // hidden tab; redrawn when it becomes visible
+
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const { width, height } = rect;
+    ctx.clearRect(0, 0, width, height);
+
+    const plan = nutritionPlan;
+    const { carbs_per_hour } = getNutritionSettings();
+    const totalSecs = plan.total_time_secs;
+    const maxG = Math.max(plan.target_carbs_g, plan.planned_carbs_g, 1) * 1.05;
+    const padLeft = 40, padRight = 8, padTop = 8, padBottom = 20;
+    const xScale = (s) => (totalSecs > 0 ? s / totalSecs : 0) * (width - padLeft - padRight) + padLeft;
+    const yScale = (g) => height - padBottom - (g / maxG) * (height - padTop - padBottom);
+
+    ctx.font = '10px sans-serif';
+    ctx.lineWidth = 1;
+    // Horizontal grid in grams.
+    const gStep = [25, 50, 100, 200, 500].find(s => maxG / s <= 6) || 1000;
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'middle';
+    for (let g = 0; g <= maxG; g += gStep) {
+        ctx.strokeStyle = '#eee';
+        ctx.beginPath();
+        ctx.moveTo(padLeft, yScale(g));
+        ctx.lineTo(width - padRight, yScale(g));
+        ctx.stroke();
+        ctx.fillStyle = '#999';
+        ctx.fillText(`${g} g`, padLeft - 4, yScale(g));
+    }
+    // Vertical grid in hours.
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    for (let h = 0; h * 3600 <= totalSecs; h++) {
+        ctx.strokeStyle = '#eee';
+        ctx.beginPath();
+        ctx.moveTo(xScale(h * 3600), padTop);
+        ctx.lineTo(xScale(h * 3600), height - padBottom);
+        ctx.stroke();
+        ctx.fillStyle = '#999';
+        ctx.fillText(`${h} h`, xScale(h * 3600), height - padBottom + 4);
+    }
+
+    // Target line.
+    ctx.save();
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = '#7f8c8d';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(xScale(0), yScale(0));
+    ctx.lineTo(xScale(totalSecs), yScale(carbs_per_hour * totalSecs / 3600));
+    ctx.stroke();
+    ctx.restore();
+
+    // Planned cumulative intake.
+    ctx.strokeStyle = '#3498db';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    plan.curve.forEach((p, i) => {
+        const x = xScale(p.time_secs), y = yScale(p.carbs_g);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Stop dots at the top of each step.
+    plan.stops.forEach(s => {
+        ctx.beginPath();
+        ctx.arc(xScale(s.time_secs), yScale(s.cumulative_carbs_g), 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = { bar: '#8e44ad', puree: '#e67e22' }[s.kind] || '#27ae60';
+        ctx.fill();
+        ctx.strokeStyle = s.on_hard_slope ? '#e74c3c' : 'white';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+    });
+};
+
+window.addEventListener('resize', () => {
+    if (activeTab === 'nutrition') drawCarbsChart();
+});
+
+const clearNutritionMarkers = () => {
+    nutritionMarkers.forEach(m => m.remove());
+    nutritionMarkers = [];
+};
+
+const renderNutritionMarkers = () => {
+    clearNutritionMarkers();
+    if (activeTab !== 'nutrition' || !nutritionPlan || !map || !mapLibAvailable()) return;
+    nutritionPlan.stops.forEach(stop => {
+        const point = routePointAtDistance(stop.distance_km);
+        if (!point) return;
+        const el = document.createElement('div');
+        el.className = `nutrition-stop-marker nutrition-stop-${stop.kind}${stop.on_hard_slope ? ' hard-slope' : ''}`;
+        el.title = stop.name;
+        const grad = `${stop.gradient_pct > 0 ? '+' : ''}${stop.gradient_pct.toFixed(1)}`;
+        const popup = new maplibregl.Popup({ offset: 10, closeButton: false }).setHTML(
+            `<strong>${escapeHtml(stop.name)}</strong> (${stop.carbs_g.toFixed(0)} g)<br>${stop.time} &middot; ${stop.distance_km.toFixed(2)} km &middot; ${grad}%${stop.aid_station ? `<br>at ${escapeHtml(stop.aid_station)}` : ''}`
+        );
+        const marker = new maplibregl.Marker({ element: el })
+            .setLngLat([point.lon, point.lat])
+            .setPopup(popup)
+            .addTo(map);
+        el.addEventListener('click', () => marker.togglePopup());
+        nutritionMarkers.push(marker);
+    });
+};
+
+const redrawChart = () => {
+    if (routePoints.length && lastChunks.length) drawElevationChart(routePoints, lastChunks);
+};
+
+const refreshNutrition = () => {
+    computeNutritionPlan();
+    renderNutritionResults();
+    renderNutritionMarkers();
+    redrawChart();
+};
+
+const setActiveTab = (tab) => {
+    activeTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tab);
+    });
+    document.querySelectorAll('[data-tab-panel]').forEach(panel => {
+        panel.classList.toggle('hidden', panel.dataset.tabPanel !== tab);
+    });
+    renderNutritionMarkers();
+    redrawChart();
+    drawCarbsChart();
+};
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.onclick = () => setActiveTab(btn.dataset.tab);
+});
+
+['carbs-per-hour', 'max-eat-uphill', 'max-eat-downhill', 'aid-window'].forEach(id => {
+    document.getElementById(id).oninput = refreshNutrition;
+});
+
+const KIND_LABELS = { gel: 'Gel', bar: 'Bar', puree: 'Purée', drink: 'Drink' };
+
+const renderProductList = () => {
+    const list = document.getElementById('product-list');
+    if (!nutritionProducts.length) {
+        list.innerHTML = '<li class="aid-station-empty">No products yet</li>';
+        return;
+    }
+    list.innerHTML = nutritionProducts.map(p => {
+        let detail = `${p.carbs_g} g`;
+        if (p.kind === 'drink') {
+            detail = `${p.carbs_g} g / ${p.minutes_per_unit} min`;
+            if (p.start_minutes !== null) detail += ` from ${p.start_minutes} min`;
+        }
+        return `
+        <li data-id="${p.id}">
+            <span class="aid-station-info">
+                <strong>${escapeHtml(p.name)}</strong>
+                <span class="aid-station-dist">${KIND_LABELS[p.kind]} &middot; ${detail} &middot; &times;${p.quantity}</span>
+            </span>
+            <button type="button" class="product-move-btn" data-id="${p.id}" data-dir="up" title="Move up">&uarr;</button>
+            <button type="button" class="product-move-btn" data-id="${p.id}" data-dir="down" title="Move down">&darr;</button>
+            <button type="button" class="aid-remove-btn" data-id="${p.id}" title="Remove">&times;</button>
+        </li>`;
+    }).join('');
+};
+
+const submitProduct = () => {
+    const name = document.getElementById('product-name').value.trim();
+    const kind = document.getElementById('product-kind').value;
+    const carbs = parseFloat(document.getElementById('product-carbs').value);
+    const quantity = parseInt(document.getElementById('product-quantity').value, 10);
+    const minutes = parseFloat(document.getElementById('product-minutes').value);
+    const start = parseFloat(document.getElementById('product-start').value);
+    if (!name || !(carbs > 0) || !(quantity >= 1)) {
+        showStatus('Enter a name, carbs (g) and quantity to add a product.', 'error');
+        setTimeout(hideStatus, 2000);
+        return;
+    }
+    if (kind === 'drink' && !(minutes > 0)) {
+        showStatus('Drinks need minutes per bottle.', 'error');
+        setTimeout(hideStatus, 2000);
+        return;
+    }
+    nutritionProducts.push({
+        id: `product-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        kind,
+        carbs_g: carbs,
+        quantity,
+        minutes_per_unit: kind === 'drink' ? minutes : 0,
+        start_minutes: kind === 'drink' && Number.isFinite(start) && start >= 0 ? start : null,
+    });
+    document.getElementById('product-name').value = '';
+    document.getElementById('product-start').value = '';
+    document.getElementById('product-carbs').value = '';
+    document.getElementById('product-quantity').value = '1';
+    renderProductList();
+    refreshNutrition();
+};
+
+document.getElementById('product-kind').onchange = (e) => {
+    const isDrink = e.target.value === 'drink';
+    document.getElementById('product-minutes').disabled = !isDrink;
+    document.getElementById('product-start').disabled = !isDrink;
+};
+document.getElementById('product-add-btn').onclick = submitProduct;
+['product-name', 'product-carbs', 'product-quantity', 'product-minutes', 'product-start'].forEach(id => {
+    document.getElementById(id).addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            submitProduct();
+        }
+    });
+});
+
+document.getElementById('product-list').addEventListener('click', (evt) => {
+    const btn = evt.target.closest('.aid-remove-btn, .product-move-btn');
+    if (!btn) return;
+    const idx = nutritionProducts.findIndex(p => p.id === btn.dataset.id);
+    if (idx < 0) return;
+    if (btn.classList.contains('product-move-btn')) {
+        const to = idx + (btn.dataset.dir === 'up' ? -1 : 1);
+        if (to < 0 || to >= nutritionProducts.length) return;
+        [nutritionProducts[idx], nutritionProducts[to]] = [nutritionProducts[to], nutritionProducts[idx]];
+    } else {
+        nutritionProducts.splice(idx, 1);
+    }
+    renderProductList();
+    refreshNutrition();
+});
+
+renderProductList();
 
 // Start initialization
 start();

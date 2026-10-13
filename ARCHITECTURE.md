@@ -88,6 +88,7 @@ sequenceDiagram
 | `pace_model.rs` | Computes pace based on gradient and fatigue. | `PaceModel`, `DegradationProfile` |
 | `chunker.rs` | **The Core Algorithm**: Merges segments into gradient blocks. | `Chunk`, `chunkify`, `apply_pace_model` |
 | `output.rs` | Formats data for storage or display. | `write_csv_to_writer` |
+| `nutrition.rs` | Nutrition planner: schedules gel/bar stops over the paced timeline (uses `Chunk::estimated_secs`). | `NutritionSettings`, `NutritionPlan`, `plan` |
 | `wasm.rs` | High-level API exposed to the browser. | `GpxAnalyzer`, `RoutePoint` |
 
 ---
@@ -139,3 +140,7 @@ The web UI renders a MapLibre GL map and a canvas-based elevation chart, both dr
 - **Elevation chart**: a `<canvas>` profile of distance vs. elevation, stroked segment-by-segment in the same colors.
 
 Both use the same color scale, built from the current `Chunk[]`: pace-based (green = fast, red = slow) whenever chunks carry `estimated_pace`, falling back to gradient-based (blue = downhill, red = uphill) before a reference activity or manual paces are supplied.
+
+## Nutrition Tab
+
+The **Nutrition** tab (next to **Pacing**) calls `GpxAnalyzer::plan_nutrition()`, which re-runs the manual pace model and passes the timed chunks to `nutrition::plan`. Drinks are sipped back-to-back from the start and count toward the carbs/h goal; each gel/bar is eaten once the goal rate has "earned" its carbs (bars and purées before gels), then moved to the nearest moment on terrain within the user's uphill/downhill eating limits (flagged `on_hard_slope` if no such terrain remains). The tab also sends the aid stations (`aid_stations`, GPX and manual) and an `aid_window_minutes` setting: a bar/purée is eaten at the closest unused aid station within that window of its ideal time (no slope limit there, one solid per station; `NutritionStop::aid_station` holds the name). This only moves the stop in time; the bars-and-purées-before-gels order never changes. While the tab is active, the map and elevation chart show the stops and shade chunks steeper than the limits.

@@ -13,11 +13,19 @@
     
     <div class="container">
         <div class="sidebar">
-            <form id="splitter-form">
+            <form id="file-form">
                 <div class="form-group">
                     <label for="input-file">Input GPX (Route) *</label>
-                    <input type="file" id="input-file" accept=".gpx" required>
+                    <input type="file" id="input-file" accept=".gpx">
                 </div>
+            </form>
+
+            <nav class="tabs" role="tablist">
+                <button type="button" class="tab-btn active" data-tab="pacing" role="tab">Pacing</button>
+                <button type="button" class="tab-btn" data-tab="nutrition" role="tab">Nutrition</button>
+            </nav>
+
+            <form id="splitter-form" data-tab-panel="pacing">
 
                 <div id="section-manual">
                     <div class="form-group">
@@ -99,19 +107,6 @@
 
                 <hr style="margin: 1.5rem 0; border: 0; border-top: 1px solid #eee;">
 
-                <div class="form-group aid-stations-panel">
-                    <label>Aid Stations</label>
-                    <div class="aid-station-add">
-                        <input type="text" id="aid-name" placeholder="Name (e.g. Ravito 1)">
-                        <input type="number" id="aid-distance" step="0.1" min="0" placeholder="km">
-                        <button type="button" id="aid-add-btn" class="btn-secondary">Add</button>
-                    </div>
-                    <p class="help-text">Click the elevation chart to fill in a distance, or type it directly. Stations found in the GPX file's own waypoints are loaded automatically.</p>
-                    <ul id="aid-station-list" class="aid-station-list"></ul>
-                </div>
-
-                <hr style="margin: 1.5rem 0; border: 0; border-top: 1px solid #eee;">
-
                 <div class="form-group">
                     <label for="tolerance">Tolerance (%)</label>
                     <input type="number" id="tolerance" step="0.1" value="2.0">
@@ -124,6 +119,65 @@
 
                 <div class="buttons">
                     <button type="button" id="download-btn" class="btn-primary">Download CSV</button>
+                </div>
+            </form>
+
+            <form id="nutrition-form" data-tab-panel="nutrition" class="hidden">
+                <div class="form-group">
+                    <label for="carbs-per-hour">Carbs goal (g/h)</label>
+                    <input type="number" id="carbs-per-hour" min="0" step="5" value="60">
+                </div>
+
+                <div class="form-group">
+                    <label for="max-eat-uphill">Max uphill gradient for eating (%)</label>
+                    <input type="number" id="max-eat-uphill" min="0" step="0.5" value="8">
+                </div>
+
+                <div class="form-group">
+                    <label for="max-eat-downhill">Max downhill gradient for eating (%)</label>
+                    <input type="number" id="max-eat-downhill" min="0" step="0.5" value="5">
+                    <p class="help-text">Gel/bar stops are moved to the nearest moment on gentler terrain. Sections steeper than these limits are shaded red on the elevation chart.</p>
+                </div>
+
+                <div class="form-group">
+                    <label for="aid-window">Aid station eating window (min)</label>
+                    <input type="number" id="aid-window" min="0" step="5" value="15">
+                    <p class="help-text">Bars and purées are moved to an aid station when one is within this many minutes of when they're due (slope limits don't apply there). Gels still come after all bars and purées. 0 disables it.</p>
+                </div>
+
+                <hr style="margin: 1.5rem 0; border: 0; border-top: 1px solid #eee;">
+
+                <div class="form-group products-panel">
+                    <label>Products carried</label>
+                    <div class="product-add">
+                        <input type="text" id="product-name" placeholder="Name (e.g. Maurten Gel 100)">
+                        <select id="product-kind">
+                            <option value="gel">Gel</option>
+                            <option value="bar">Bar</option>
+                            <option value="puree">Purée</option>
+                            <option value="drink">Drink</option>
+                        </select>
+                        <input type="number" id="product-carbs" min="1" step="1" placeholder="Carbs (g)">
+                        <input type="number" id="product-quantity" min="1" step="1" value="1" placeholder="Qty">
+                        <input type="number" id="product-minutes" min="1" step="5" placeholder="Min / bottle" disabled>
+                        <input type="number" id="product-start" min="0" step="5" placeholder="Start (min), drinks only" disabled>
+                        <button type="button" id="product-add-btn" class="btn-secondary">Add</button>
+                    </div>
+                    <p class="help-text">Gels, bars and purées become stops on the map; bars and purées are eaten first (at aid stations when possible, see the eating window above), then gels. Drinks are sipped continuously: one bottle lasts 'Min / bottle' minutes and its carbs count toward the hourly goal. A drink starts at its 'Start (min)' if set (e.g. 120 to save it for the second half), otherwise right after the previous drink in the list. Use the arrows to reorder the list and try variants.</p>
+                    <ul id="product-list" class="aid-station-list"></ul>
+                </div>
+
+                <hr style="margin: 1.5rem 0; border: 0; border-top: 1px solid #eee;">
+
+                <div class="form-group aid-stations-panel">
+                    <label>Aid Stations</label>
+                    <div class="aid-station-add">
+                        <input type="text" id="aid-name" placeholder="Name (e.g. Ravito 1)">
+                        <input type="number" id="aid-distance" step="0.1" min="0" placeholder="km">
+                        <button type="button" id="aid-add-btn" class="btn-secondary">Add</button>
+                    </div>
+                    <p class="help-text">Click the elevation chart to fill in a distance, or type it directly. Stations found in the GPX file's own waypoints are loaded automatically.</p>
+                    <ul id="aid-station-list" class="aid-station-list"></ul>
                 </div>
             </form>
             <div id="status"></div>
@@ -140,10 +194,14 @@
                 <div id="chart-legend" class="chart-legend"></div>
             </div>
 
-            <div id="results-container">
+            <div id="results-container" data-tab-panel="pacing">
                 <div class="empty-state">
                     Upload a GPX file to see the analysis grid
                 </div>
+            </div>
+
+            <div id="nutrition-container" data-tab-panel="nutrition" class="hidden">
+                <div class="empty-state">Upload a GPX file and add products to plan your nutrition</div>
             </div>
         </div>
     </div>
