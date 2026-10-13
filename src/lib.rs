@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod nutrition;
 pub mod output;
 pub mod pace_model;
 pub mod parser;

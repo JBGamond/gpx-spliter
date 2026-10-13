@@ -88,6 +88,7 @@ mod tests {
             estimated_pace: Some("06:00".to_string()),
             estimated_time: Some("00:07:24".to_string()),
             cumulative_time: Some("00:07:24".to_string()),
+            estimated_secs: Some(444.0),
         }
     }
 

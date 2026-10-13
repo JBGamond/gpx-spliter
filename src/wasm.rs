@@ -1,6 +1,6 @@
 #![cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
-use crate::{chunker, output, parser};
+use crate::{chunker, nutrition, output, parser};
 use crate::pace_model::ManualPaces;
 use crate::trackpoint::Segment;
 use geo::{Distance, Haversine, Point};
@@ -125,7 +125,10 @@ impl GpxAnalyzer {
             .map_err(|e| JsError::new(&format!("Failed to serialize aid stations: {}", e)))
     }
 
-    pub fn analyze(
+    /// Chunk the route and apply the manual pace model. Shared by every
+    /// export that needs timed chunks.
+    #[allow(clippy::too_many_arguments)]
+    fn paced_chunks(
         &self,
         tolerance: f64,
         min_distance: f64,
@@ -134,7 +137,7 @@ impl GpxAnalyzer {
         fatigue_exponent: f64,
         wall_onset: f64,
         downhill_degradation: f64,
-    ) -> Result<JsValue, JsError> {
+    ) -> Result<Vec<chunker::Chunk>, JsError> {
         let mut chunks = chunker::chunkify(&self.input_segments, tolerance, min_distance);
 
         let manual_paces: ManualPaces = serde_wasm_bindgen::from_value(manual_paces_val)
@@ -147,6 +150,28 @@ impl GpxAnalyzer {
             wall_onset,
             downhill_degradation,
         );
+        Ok(chunks)
+    }
+
+    pub fn analyze(
+        &self,
+        tolerance: f64,
+        min_distance: f64,
+        manual_paces_val: JsValue,
+        degradation_factor: f64,
+        fatigue_exponent: f64,
+        wall_onset: f64,
+        downhill_degradation: f64,
+    ) -> Result<JsValue, JsError> {
+        let chunks = self.paced_chunks(
+            tolerance,
+            min_distance,
+            manual_paces_val,
+            degradation_factor,
+            fatigue_exponent,
+            wall_onset,
+            downhill_degradation,
+        )?;
 
         serde_wasm_bindgen::to_value(&chunks)
             .map_err(|e| JsError::new(&format!("Failed to serialize chunks: {}", e)))
@@ -162,18 +187,15 @@ impl GpxAnalyzer {
         wall_onset: f64,
         downhill_degradation: f64,
     ) -> Result<String, JsError> {
-        let mut chunks = chunker::chunkify(&self.input_segments, tolerance, min_distance);
-
-        let manual_paces: ManualPaces = serde_wasm_bindgen::from_value(manual_paces_val)
-            .map_err(|e| JsError::new(&format!("Invalid manual paces: {}", e)))?;
-        chunker::apply_manual_paces(
-            &mut chunks,
-            &manual_paces,
+        let chunks = self.paced_chunks(
+            tolerance,
+            min_distance,
+            manual_paces_val,
             degradation_factor,
             fatigue_exponent,
             wall_onset,
             downhill_degradation,
-        );
+        )?;
 
         let mut buffer = Vec::new();
         output::write_csv_to_writer(&chunks, &mut buffer)
@@ -181,5 +203,36 @@ impl GpxAnalyzer {
 
         String::from_utf8(buffer)
             .map_err(|e| JsError::new(&format!("Invalid UTF-8 in CSV: {}", e)))
+    }
+
+    /// Plan gel/bar stops and drink intake over the paced race timeline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_nutrition(
+        &self,
+        tolerance: f64,
+        min_distance: f64,
+        manual_paces_val: JsValue,
+        degradation_factor: f64,
+        fatigue_exponent: f64,
+        wall_onset: f64,
+        downhill_degradation: f64,
+        settings_val: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let chunks = self.paced_chunks(
+            tolerance,
+            min_distance,
+            manual_paces_val,
+            degradation_factor,
+            fatigue_exponent,
+            wall_onset,
+            downhill_degradation,
+        )?;
+
+        let settings: nutrition::NutritionSettings = serde_wasm_bindgen::from_value(settings_val)
+            .map_err(|e| JsError::new(&format!("Invalid nutrition settings: {}", e)))?;
+
+        let plan = nutrition::plan(&chunks, &settings);
+        serde_wasm_bindgen::to_value(&plan)
+            .map_err(|e| JsError::new(&format!("Failed to serialize nutrition plan: {}", e)))
     }
 }

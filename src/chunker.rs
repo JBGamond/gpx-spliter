@@ -34,6 +34,9 @@ pub struct Chunk {
     /// Cumulative estimated time from start as "HH:MM:SS".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cumulative_time: Option<String>,
+    /// Estimated duration of this chunk in seconds (set alongside `estimated_time`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_secs: Option<f64>,
 }
 
 impl Chunk {
@@ -76,6 +79,7 @@ pub fn apply_pace_model(chunks: &mut Vec<Chunk>, model: &PaceModel, terrain: Ter
             chunk.fatigue_pct = (multiplier - 1.0) * 100.0;
             chunk.estimated_pace = Some(format_pace(degraded_spm));
             chunk.estimated_time = Some(format_duration(chunk_secs));
+            chunk.estimated_secs = Some(chunk_secs);
             chunk.cumulative_time = Some(format_duration(cumulative_secs));
         }
     }
@@ -114,6 +118,7 @@ pub fn apply_manual_paces(
         chunk.fatigue_pct = (multiplier - 1.0) * 100.0;
         chunk.estimated_pace = Some(format_pace(degraded_spm));
         chunk.estimated_time = Some(format_duration(chunk_secs));
+        chunk.estimated_secs = Some(chunk_secs);
         chunk.cumulative_time = Some(format_duration(cumulative_secs));
     }
 }
@@ -183,6 +188,7 @@ pub fn chunkify(segments: &[Segment], tolerance: f64, min_chunk_distance_m: f64)
                 estimated_pace: None,
                 estimated_time: None,
                 cumulative_time: None,
+                estimated_secs: None,
             });
             chunk_number += 1;
 
@@ -222,6 +228,7 @@ pub fn chunkify(segments: &[Segment], tolerance: f64, min_chunk_distance_m: f64)
         estimated_pace: None,
         estimated_time: None,
         cumulative_time: None,
+        estimated_secs: None,
     });
 
     chunks
