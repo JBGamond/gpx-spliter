@@ -179,4 +179,112 @@ mod tests {
         assert_eq!(waypoints[0].name, "Ravito 1");
         assert_eq!(waypoints[0].elevation, Some(1200.0));
     }
+
+    fn gpx_with_points(points: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><trkseg>{points}</trkseg></trk>
+</gpx>"#
+        )
+    }
+
+    #[test]
+    fn segments_carry_distance_gain_loss_and_gradient() {
+        // 9 points, 0.001° latitude apart (~111 m): a steady 10 m/step climb
+        // survives smoothing in the interior; reversed it is a descent.
+        let ramp = |sign: f64| {
+            let pts: String = (0..9)
+                .map(|i| {
+                    format!(
+                        r#"<trkpt lat="{:.3}" lon="6.0"><ele>{}</ele></trkpt>"#,
+                        45.0 + i as f64 * 0.001,
+                        1000.0 + sign * i as f64 * 10.0
+                    )
+                })
+                .collect();
+            parse_gpx_reader(gpx_with_points(&pts).as_bytes()).unwrap()
+        };
+
+        let up = ramp(1.0);
+        assert_eq!(up.len(), 8);
+        let mid = &up[4];
+        assert!((mid.distance_m - 111.2).abs() < 1.0, "distance {}", mid.distance_m);
+        assert!((mid.gradient_pct - 10.0 / 111.2 * 100.0).abs() < 0.1, "{}", mid.gradient_pct);
+        assert!((mid.elevation_gain - 10.0).abs() < 0.01 && mid.elevation_loss == 0.0);
+
+        let down = ramp(-1.0);
+        let mid = &down[4];
+        assert!(mid.gradient_pct < 0.0);
+        assert!((mid.elevation_loss - 10.0).abs() < 0.01 && mid.elevation_gain == 0.0);
+    }
+
+    #[test]
+    fn identical_points_give_zero_gradient_without_nan() {
+        let gpx = gpx_with_points(
+            r#"<trkpt lat="45.0" lon="6.0"><ele>100</ele></trkpt>
+<trkpt lat="45.0" lon="6.0"><ele>100</ele></trkpt>"#,
+        );
+        let segs = parse_gpx_reader(gpx.as_bytes()).unwrap();
+        assert_eq!(segs[0].distance_m, 0.0);
+        assert_eq!(segs[0].gradient_pct, 0.0);
+    }
+
+    #[test]
+    fn points_without_elevation_are_dropped() {
+        let gpx = gpx_with_points(
+            r#"<trkpt lat="45.000" lon="6.0"><ele>100</ele></trkpt>
+<trkpt lat="45.001" lon="6.0"></trkpt>
+<trkpt lat="45.002" lon="6.0"><ele>100</ele></trkpt>"#,
+        );
+        let segs = parse_gpx_reader(gpx.as_bytes()).unwrap();
+        assert_eq!(segs.len(), 1, "the point without <ele> must not form a segment");
+    }
+
+    #[test]
+    fn fewer_than_two_elevation_points_is_an_error() {
+        let gpx = gpx_with_points(r#"<trkpt lat="45.0" lon="6.0"><ele>100</ele></trkpt>"#);
+        let err = parse_gpx_reader(gpx.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("at least 2 points"), "{err}");
+    }
+
+    #[test]
+    fn malformed_xml_is_an_error() {
+        let err = parse_gpx_reader("<gpx><trk>".as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse GPX data"), "{err}");
+        assert!(parse_gpx_waypoints_reader("not xml".as_bytes()).is_err());
+    }
+
+    #[test]
+    fn missing_file_error_names_the_path() {
+        let err = parse_gpx(Path::new("/nonexistent/route.gpx")).unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/route.gpx"), "{err}");
+    }
+
+    #[test]
+    fn parse_gpx_reads_from_disk() {
+        let path = std::env::temp_dir().join("gpx_splitter_parser_test.gpx");
+        std::fs::write(
+            &path,
+            gpx_with_points(
+                r#"<trkpt lat="45.000" lon="6.0"><ele>100</ele></trkpt>
+<trkpt lat="45.001" lon="6.0"><ele>110</ele></trkpt>"#,
+            ),
+        )
+        .unwrap();
+        let segs = parse_gpx(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(segs.len(), 1);
+    }
+
+    #[test]
+    fn unnamed_waypoint_gets_default_name_and_missing_elevation() {
+        let gpx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
+  <wpt lat="45.0" lon="6.0"></wpt>
+</gpx>"#;
+        let wps = parse_gpx_waypoints_reader(gpx.as_bytes()).unwrap();
+        assert_eq!(wps[0].name, "Aid station");
+        assert_eq!(wps[0].elevation, None);
+    }
 }

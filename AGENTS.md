@@ -41,6 +41,7 @@ wasm-pack build --target web --out-dir static/pkg -- --no-default-features --fea
 ./build.sh                                 # wasm-pack + docker build (--no-cache)
 docker compose up -d                       # Caddy on :8080 -> static/
 cargo fmt && cargo clippy && cargo test
+cargo llvm-cov --summary-only             # coverage (nix shell); see docs/adr/0002
 ```
 No CI exists. WASM build **requires** `--no-default-features` (tokio/axum don't target wasm). Docker image does not build Rust; `static/pkg` must exist on host first.
 

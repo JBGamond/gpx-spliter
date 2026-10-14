@@ -20,7 +20,7 @@
             overlays = [ rust-overlay.overlays.default ];
           };
           rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" ];
+            extensions = [ "rust-src" "rust-analyzer" "llvm-tools-preview" ];
             targets = [ "wasm32-unknown-unknown" ];
           };
         in
@@ -32,6 +32,7 @@
               pkgs.wasm-bindgen-cli
               pkgs.pkg-config
               pkgs.cargo-watch
+              pkgs.cargo-llvm-cov
             ];
 
             RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";

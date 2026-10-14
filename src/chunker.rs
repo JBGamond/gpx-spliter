@@ -285,4 +285,124 @@ mod tests {
         let chunks = chunkify(&segments, 2.0, 200.0);
         assert!(chunks.len() >= 2, "Expected at least 2 chunks, got {}", chunks.len());
     }
+
+    fn make_chunk(number: usize, distance_km: f64, cumulative_km: f64, gradient_pct: f64) -> Chunk {
+        Chunk {
+            chunk_number: number,
+            distance_km,
+            cumulative_km,
+            elevation_gain_m: 0.0,
+            elevation_loss_m: 0.0,
+            cumulative_gain_m: 0.0,
+            cumulative_loss_m: 0.0,
+            gradient_pct,
+            classification: Chunk::classify_gradient(gradient_pct),
+            fatigue_pct: 0.0,
+            estimated_pace: None,
+            estimated_time: None,
+            cumulative_time: None,
+            estimated_secs: None,
+        }
+    }
+
+    #[test]
+    fn classification_bands_cover_both_directions() {
+        let cases = [
+            (0.5, "flat"),
+            (-0.5, "flat"),
+            (2.0, "gentle uphill"),
+            (-2.0, "gentle downhill"),
+            (4.0, "moderate uphill"),
+            (-4.0, "moderate downhill"),
+            (8.0, "steep uphill"),
+            (-8.0, "steep downhill"),
+            (15.0, "very steep uphill"),
+            (-15.0, "very steep downhill"),
+        ];
+        for (gradient, expected) in cases {
+            assert_eq!(Chunk::classify_gradient(gradient), expected, "gradient {gradient}");
+        }
+    }
+
+    #[test]
+    fn manual_paces_with_no_degradation_gives_flat_pace_and_cumulative_time() {
+        let paces = ManualPaces::from_flat_pace(0.3, 1.0); // 5:00 /km
+        let mut chunks = vec![make_chunk(1, 1.0, 1.0, 0.0), make_chunk(2, 1.0, 2.0, 0.0)];
+        apply_manual_paces(&mut chunks, &paces, 0.0, 1.0, 0.0, 0.0);
+
+        for c in &chunks {
+            assert!(c.fatigue_pct.abs() < 1e-9);
+            assert!((c.estimated_secs.unwrap() - 300.0).abs() < 1.0);
+        }
+        assert_eq!(chunks[0].cumulative_time.as_deref(), Some("00:05:00"));
+        assert_eq!(chunks[1].cumulative_time.as_deref(), Some("00:10:00"));
+    }
+
+    #[test]
+    fn manual_paces_fatigue_grows_towards_the_finish() {
+        let paces = ManualPaces::from_flat_pace(0.3, 1.0);
+        let mut chunks = vec![make_chunk(1, 5.0, 5.0, 0.0), make_chunk(2, 5.0, 10.0, 0.0)];
+        apply_manual_paces(&mut chunks, &paces, 0.20, 1.0, 0.0, 0.0);
+
+        assert!(chunks[0].fatigue_pct > 0.0);
+        assert!(chunks[1].fatigue_pct > chunks[0].fatigue_pct);
+        assert!(chunks[1].estimated_secs.unwrap() > chunks[0].estimated_secs.unwrap());
+    }
+
+    #[test]
+    fn manual_paces_downhill_degradation_only_slows_descents() {
+        let paces = ManualPaces::from_flat_pace(0.3, 1.0);
+        let mut base = vec![make_chunk(1, 2.0, 2.0, -8.0), make_chunk(2, 2.0, 4.0, 0.0)];
+        let mut damaged = base.clone();
+        apply_manual_paces(&mut base, &paces, 0.0, 1.0, 0.0, 0.0);
+        apply_manual_paces(&mut damaged, &paces, 0.0, 1.0, 0.0, 1.0);
+
+        assert!(damaged[0].estimated_secs.unwrap() > base[0].estimated_secs.unwrap());
+        assert!(
+            (damaged[1].estimated_secs.unwrap() - base[1].estimated_secs.unwrap()).abs() < 1e-9,
+            "flat chunk must be unaffected"
+        );
+    }
+
+    fn flat_reference_model() -> PaceModel {
+        let segs: Vec<crate::ref_parser::RefSegment> = (0..4)
+            .map(|_| crate::ref_parser::RefSegment {
+                distance_m: 500.0,
+                elapsed_secs: 150.0,
+                gradient_pct: 0.0,
+            })
+            .collect();
+        PaceModel::from_segments(&segs)
+    }
+
+    #[test]
+    fn pace_model_fills_pace_fields_and_accumulates_time() {
+        let model = flat_reference_model();
+        let mut chunks = vec![make_chunk(1, 1.0, 1.0, 0.0), make_chunk(2, 1.0, 2.0, 0.0)];
+        apply_pace_model(&mut chunks, &model, TerrainType::Road);
+
+        let first = chunks[0].estimated_secs.unwrap();
+        let second = chunks[1].estimated_secs.unwrap();
+        assert!(first > 0.0 && second > 0.0);
+        assert_eq!(chunks[0].cumulative_time.as_deref(), Some(format_duration(first).as_str()));
+        assert_eq!(
+            chunks[1].cumulative_time.as_deref(),
+            Some(format_duration(first + second).as_str())
+        );
+        assert!(chunks[0].estimated_pace.is_some());
+    }
+
+    #[test]
+    fn trail_terrain_slows_steep_descents_but_not_flat() {
+        let model = flat_reference_model();
+        let mut road = vec![make_chunk(1, 1.0, 1.0, -12.0), make_chunk(2, 1.0, 2.0, 0.0)];
+        let mut trail = road.clone();
+        apply_pace_model(&mut road, &model, TerrainType::Road);
+        apply_pace_model(&mut trail, &model, TerrainType::Trail);
+
+        assert!(trail[0].estimated_secs.unwrap() > road[0].estimated_secs.unwrap());
+        assert!(
+            (trail[1].estimated_secs.unwrap() - road[1].estimated_secs.unwrap()).abs() < 1e-9
+        );
+    }
 }
