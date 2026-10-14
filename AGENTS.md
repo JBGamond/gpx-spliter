@@ -1,13 +1,13 @@
 # Repository Guidelines
 
 ## Decision Protocol (MANDATORY)
-- **Consult the user (jbgamond) before any decision** that has alternatives: dependency/feature changes, public API or CSV format changes, module layout, build/deploy changes, model/algorithm changes. Use the ask tool; present options and tradeoffs. Do not decide silently.
-- **Log every decision as an ADR** in `docs/`:
-  - Index: `docs/README.md` (main file; table linking every ADR).
-  - One file per ADR: `docs/adr/NNNN-kebab-title.md` (zero-padded, sequential; never renumber).
-  - Each ADR: Status, Date, Decider (user), Context, Options considered, Decision, Consequences. Use relative links; link back to `../README.md`.
-  - Adding an ADR = create file + add row to index in the same change. Superseding: set old status to `Superseded by [NNNN](...)`, never delete.
-  - Template and rationale: [ADR-0001](docs/adr/0001-record-decisions-as-adrs.md).
+- **Consult the user (jbgamond) before any significant decision** with real alternatives: dependencies/features, public API or CSV format, module layout, build/deploy/tooling, model/algorithm changes. Use the ask tool; present options and tradeoffs. Routine choices (test names, local refactors, thresholds within an agreed policy) need no ADR.
+- **Log only significant decisions as ADRs** in `docs/`:
+  - Index: `docs/README.md` (table linking every ADR).
+  - One short file per ADR: `docs/adr/NNNN-kebab-title.md` (sequential; never renumber).
+  - Each ADR: Status, Date, Decision, Consequences (a few lines each). Add Context/Options only if non-obvious. Link back to `../README.md`.
+  - Add file + index row in the same change. Superseding: mark old `Superseded by [NNNN](...)`, never delete.
+  - Rationale: [ADR-0001](docs/adr/0001-record-decisions-as-adrs.md).
 
 ## Project Overview
 `gpx-splitter`: Rust (edition 2024) tool that splits a race-route GPX into gradient-consistent chunks, optionally estimates pace/time/fatigue, plans nutrition, and emits a `;`-delimited CSV. Three front doors over one library: CLI, WASM browser UI, and a static-file web server.
@@ -67,4 +67,4 @@ No CI exists. WASM build **requires** `--no-default-features` (tokio/axum don't 
 ## Testing & QA
 - Built-in `#[test]` in inline `#[cfg(test)] mod tests` per module (~55 tests: nutrition, pace_model, parser, chunker, output). Run `cargo test [name]`.
 - Fixtures are inline (`r#"<gpx>..."#`) and local helpers (`chunks()`, `pt()`, `make_chunk()`); floats compared with epsilon.
-- Untested: `wasm.rs`, `main.rs`, `web.rs`, `ref_parser.rs`, track parsing, malformed GPX, JS. Add tests when touching these.
+- Coverage ~94% lines (see docs/adr/0003). Untested: `wasm.rs`, `main.rs`, `web.rs`, JS. Add tests when touching these.
