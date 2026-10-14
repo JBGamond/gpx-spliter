@@ -9,6 +9,10 @@
 //! purées are eaten at an aid station whenever one lies within the window of
 //! their ideal time (slope limits don't apply: you're standing still). Bars and
 //! purées still come before gels either way.
+//!
+//! Manual stops are applied on top of the automatic plan without rippling into
+//! it: they either move one planned stop to a chosen km, or place a spare unit
+//! (one the plan left unused) there.
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +59,19 @@ pub struct AidStationInput {
     pub distance_km: f64,
 }
 
+/// A hand-placed stop at a route distance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManualStopInput {
+    /// Caller-chosen id, echoed back as `NutritionStop::manual_id`.
+    pub id: String,
+    pub product_index: usize,
+    /// `Some(n)`: move the n-th planned stop of this product (see
+    /// `NutritionStop::occurrence`). `None`: place a spare unit the plan left unused.
+    #[serde(default)]
+    pub occurrence: Option<usize>,
+    pub distance_km: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NutritionSettings {
     pub carbs_per_hour: f64,
@@ -70,6 +87,9 @@ pub struct NutritionSettings {
     /// be moved to reach an aid station. 0 disables aid-station eating.
     #[serde(default)]
     pub aid_window_minutes: f64,
+    /// Hand-placed stops, applied after the automatic plan.
+    #[serde(default)]
+    pub manual_stops: Vec<ManualStopInput>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +108,11 @@ pub struct NutritionStop {
     pub on_hard_slope: bool,
     /// Name of the aid station the stop was snapped to, if any.
     pub aid_station: Option<String>,
+    /// For stops of the automatic plan: rank among that product's planned
+    /// stops (so a manual move can refer to it). `None` for spare units placed by hand.
+    pub occurrence: Option<usize>,
+    /// Id of the manual stop that placed or moved this one.
+    pub manual_id: Option<String>,
     /// Solids eaten so far (incl. this one) + drink carbs by `time_secs`.
     pub cumulative_carbs_g: f64,
 }
@@ -282,24 +307,90 @@ struct AidSlot<'a> {
     chunk: usize,
 }
 
+/// Time and chunk index at which the runner reaches `km`, if it's on the route.
+fn locate_km(timeline: &[TimedChunk], km: f64) -> Option<(f64, usize)> {
+    let chunk = timeline
+        .iter()
+        .position(|c| km >= c.start_km - EPS && km <= c.end_km + EPS)?;
+    let c = &timeline[chunk];
+    let span = c.end_km - c.start_km;
+    let time = if span > 0.0 {
+        c.start_s + ((km - c.start_km) / span).clamp(0.0, 1.0) * (c.end_s - c.start_s)
+    } else {
+        c.start_s
+    };
+    Some((time, chunk))
+}
+
 /// Maps each aid station onto the timeline; stations off the route are dropped.
 fn build_aid_slots<'a>(timeline: &[TimedChunk], stations: &'a [AidStationInput]) -> Vec<AidSlot<'a>> {
     stations
         .iter()
         .filter_map(|s| {
-            let chunk = timeline
-                .iter()
-                .position(|c| s.distance_km >= c.start_km - EPS && s.distance_km <= c.end_km + EPS)?;
-            let c = &timeline[chunk];
-            let span = c.end_km - c.start_km;
-            let time = if span > 0.0 {
-                c.start_s + ((s.distance_km - c.start_km) / span).clamp(0.0, 1.0) * (c.end_s - c.start_s)
-            } else {
-                c.start_s
-            };
+            let (time, chunk) = locate_km(timeline, s.distance_km)?;
             Some(AidSlot { name: &s.name, time, chunk })
         })
         .collect()
+}
+
+/// Applies `settings.manual_stops`: moves planned stops and places spare
+/// units. Entries that no longer match anything (stale occurrence, no spare
+/// unit left, km off the route) are ignored.
+fn apply_manual_stops(
+    timeline: &[TimedChunk],
+    settings: &NutritionSettings,
+    stops: &mut Vec<NutritionStop>,
+    remaining: &mut [u32],
+    usage: &mut [ProductUsage],
+) {
+    for m in &settings.manual_stops {
+        let Some(p) = settings.products.get(m.product_index) else { continue };
+        let Some((t, chunk_idx)) = locate_km(timeline, m.distance_km) else { continue };
+        let c = &timeline[chunk_idx];
+
+        let stop = match m.occurrence {
+            Some(n) => {
+                let Some(s) = stops
+                    .iter_mut()
+                    .find(|s| s.product_index == m.product_index && s.occurrence == Some(n))
+                else {
+                    continue;
+                };
+                s
+            }
+            None => {
+                if remaining[m.product_index] == 0 {
+                    continue;
+                }
+                remaining[m.product_index] -= 1;
+                usage[m.product_index].used_units += 1.0;
+                stops.push(NutritionStop {
+                    product_index: m.product_index,
+                    name: p.name.clone(),
+                    kind: p.kind,
+                    carbs_g: p.carbs_g,
+                    ideal_time_secs: t,
+                    time_secs: t,
+                    time: String::new(),
+                    distance_km: 0.0,
+                    gradient_pct: 0.0,
+                    on_hard_slope: false,
+                    aid_station: None,
+                    occurrence: None,
+                    manual_id: None,
+                    cumulative_carbs_g: 0.0,
+                });
+                stops.last_mut().expect("just pushed")
+            }
+        };
+        stop.time_secs = t;
+        stop.time = format_duration(t);
+        stop.distance_km = km_at(c, t);
+        stop.gradient_pct = c.gradient_pct;
+        stop.on_hard_slope = false;
+        stop.aid_station = None;
+        stop.manual_id = Some(m.id.clone());
+    }
 }
 
 /// Index of the unused station closest to `ideal` (within `window_secs`, and
@@ -412,7 +503,8 @@ pub fn plan(chunks: &[Chunk], settings: &NutritionSettings) -> NutritionPlan {
     let aid_active = window_secs > 0.0 && !aid_slots.is_empty();
     let mut aid_used = vec![false; aid_slots.len()];
 
-    let mut stops = Vec::new();
+    let mut stops: Vec<NutritionStop> = Vec::new();
+    let mut occurrences = vec![0usize; products.len()];
     let mut consumed_solids = 0.0;
     let mut t_prev = 0.0;
 
@@ -475,14 +567,27 @@ pub fn plan(chunks: &[Chunk], settings: &NutritionSettings) -> NutritionPlan {
             gradient_pct: c.gradient_pct,
             on_hard_slope,
             aid_station,
-            cumulative_carbs_g: consumed_solids + drink_carbs_at(&windows, t),
+            occurrence: Some(occurrences[i]),
+            manual_id: None,
+            cumulative_carbs_g: 0.0,
         });
+        occurrences[i] += 1;
+    }
+
+    apply_manual_stops(&timeline, settings, &mut stops, &mut remaining, &mut usage);
+
+    // Stops may have moved: order them and recompute the running total.
+    stops.sort_by(|a, b| a.time_secs.total_cmp(&b.time_secs));
+    let mut solids = 0.0;
+    for s in &mut stops {
+        solids += s.carbs_g;
+        s.cumulative_carbs_g = solids + drink_carbs_at(&windows, s.time_secs);
     }
 
     let curve = build_curve(&windows, &stops, total_secs);
     let target_carbs_g = settings.carbs_per_hour * total_secs / 3600.0;
     let drink_carbs_g = drink_carbs_at(&windows, total_secs);
-    let solid_carbs_g = consumed_solids;
+    let solid_carbs_g = solids;
     let planned_carbs_g = drink_carbs_g + solid_carbs_g;
     let out_of_solids = remaining.iter().all(|&r| r == 0);
     let shortfall_g = if out_of_solids {
@@ -559,6 +664,7 @@ mod tests {
             products,
             aid_stations: Vec::new(),
             aid_window_minutes: 0.0,
+            manual_stops: Vec::new(),
         }
     }
 
@@ -759,6 +865,57 @@ mod tests {
         assert_times(&times(&plan), &[2700.0, 3600.0]);
         assert!(plan.stops[0].aid_station.is_some());
         assert!(plan.stops[1].aid_station.is_none());
+    }
+
+    fn manual(id: &str, product_index: usize, occurrence: Option<usize>, km: f64) -> ManualStopInput {
+        ManualStopInput { id: id.to_string(), product_index, occurrence, distance_km: km }
+    }
+
+    #[test]
+    fn moving_a_planned_stop_leaves_the_others_alone() {
+        let c = chunks(&[(20.0, 7200.0, 0.0)]);
+        let mut s = settings(60.0, vec![gel(30.0, 4)]);
+        // Baseline 1800/3600/5400/7200; move the 2nd gel to km 4 (1440 s).
+        s.manual_stops = vec![manual("m1", 0, Some(1), 4.0)];
+        let plan = plan(&c, &s);
+        assert_times(&times(&plan), &[1440.0, 1800.0, 5400.0, 7200.0]);
+        let moved = &plan.stops[0];
+        assert_eq!(moved.manual_id.as_deref(), Some("m1"));
+        assert_eq!(moved.occurrence, Some(1));
+        assert!((moved.ideal_time_secs - 3600.0).abs() < 1e-6);
+        assert!(plan.stops[1..].iter().all(|s| s.manual_id.is_none()));
+        let totals: Vec<f64> = plan.stops.iter().map(|s| s.cumulative_carbs_g).collect();
+        assert_eq!(totals, [30.0, 60.0, 90.0, 120.0]);
+        assert!((plan.solid_carbs_g - 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spare_unit_can_be_placed_but_only_once_per_unit() {
+        let c = chunks(&[(20.0, 7200.0, 0.0)]);
+        let mut s = settings(60.0, vec![gel(30.0, 5)]);
+        // The plan uses 4 of 5 gels; only one spare exists.
+        s.manual_stops = vec![manual("a", 0, None, 2.0), manual("b", 0, None, 12.0)];
+        let plan = plan(&c, &s);
+        assert_times(&times(&plan), &[720.0, 1800.0, 3600.0, 5400.0, 7200.0]);
+        assert_eq!(plan.stops[0].manual_id.as_deref(), Some("a"));
+        assert_eq!(plan.stops[0].occurrence, None);
+        assert_eq!(plan.usage[0].used_units, 5.0);
+        assert!((plan.solid_carbs_g - 150.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stale_manual_stops_are_ignored() {
+        let c = chunks(&[(20.0, 7200.0, 0.0)]);
+        let mut s = settings(60.0, vec![gel(30.0, 4)]);
+        // No 10th gel in the plan, no spare unit, and km 99 is off the route.
+        s.manual_stops = vec![
+            manual("a", 0, Some(9), 3.0),
+            manual("b", 0, None, 3.0),
+            manual("c", 0, Some(0), 99.0),
+        ];
+        let plan = plan(&c, &s);
+        assert_times(&times(&plan), &[1800.0, 3600.0, 5400.0, 7200.0]);
+        assert!(plan.stops.iter().all(|s| s.manual_id.is_none()));
     }
 
     #[test]

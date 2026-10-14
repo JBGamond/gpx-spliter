@@ -13,6 +13,12 @@ let activeTab = 'pacing'; // 'pacing' | 'nutrition'
 let nutritionProducts = []; // {id, name, kind, carbs_g, quantity, minutes_per_unit, start_minutes}[] (in memory only)
 let nutritionPlan = null; // result of analyzer.plan_nutrition(), or null
 let nutritionMarkers = []; // maplibregl.Marker instances mirroring nutritionPlan.stops
+let manualStops = []; // {id, productId, occurrence: number|null, distance_km}[]: stops moved or placed by hand (per route, not saved)
+let stopHitboxes = []; // {stop, x, y} of the stop dots on the elevation chart, rebuilt on every draw (for dragging)
+let stopDrag = null; // {stop, km, startX, moved} while a stop dot is being dragged
+let draggedSpare = null; // {productId, kind} while a spare product chip is being dragged
+let dropPreview = null; // {kind, km} while a spare chip hovers the elevation chart
+let suppressChartClick = false; // a drag must not also count as a click that fills the aid-station distance
 
 const status = document.getElementById('status');
 const resultsContainer = document.getElementById('results-container');
@@ -462,20 +468,48 @@ const drawNoEatZones = (ctx, xScale, chunks, top, bottom) => {
     ctx.restore();
 };
 
+const KIND_COLORS = { gel: '#27ae60', bar: '#8e44ad', puree: '#e67e22' };
+
 const drawNutritionStops = (ctx, xScale, yScale) => {
+    stopHitboxes = [];
     if (!nutritionPlan) return;
     ctx.save();
-    nutritionPlan.stops.forEach(stop => {
-        const point = routePointAtDistance(stop.distance_km);
-        if (!point) return;
+    const drawDot = (km, kind, stroke, radius, lineWidth) => {
+        const point = routePointAtDistance(km);
+        if (!point) return null;
+        const x = xScale(km);
+        const y = yScale(point.elevation);
         ctx.beginPath();
-        ctx.arc(xScale(stop.distance_km), yScale(point.elevation), 4.5, 0, Math.PI * 2);
-        ctx.fillStyle = { bar: '#8e44ad', puree: '#e67e22' }[stop.kind] || '#27ae60';
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.fillStyle = KIND_COLORS[kind] || '#27ae60';
         ctx.fill();
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = stop.on_hard_slope ? '#e74c3c' : 'white';
+        ctx.lineWidth = lineWidth;
+        ctx.strokeStyle = stroke;
         ctx.stroke();
+        return { x, y };
+    };
+    nutritionPlan.stops.forEach(stop => {
+        if (stopDrag && stopDrag.moved && stopDrag.stop === stop) return;
+        const stroke = stop.manual_id ? '#2c3e50' : stop.on_hard_slope ? '#e74c3c' : 'white';
+        const pos = drawDot(stop.distance_km, stop.kind, stroke, 4.5, 2);
+        if (pos) stopHitboxes.push({ stop, x: pos.x, y: pos.y });
     });
+
+    // The dot being dragged (or a spare hovering the chart), with a guide line.
+    const preview = stopDrag && stopDrag.moved
+        ? { kind: stopDrag.stop.kind, km: stopDrag.km }
+        : dropPreview;
+    if (preview && chartLayout) {
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = '#7f8c8d';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xScale(preview.km), 8);
+        ctx.lineTo(xScale(preview.km), chartLayout.height - 20);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        drawDot(preview.km, preview.kind, '#2c3e50', 6.5, 2.5);
+    }
     ctx.restore();
 };
 
@@ -652,6 +686,7 @@ document.getElementById('elevation-chart').addEventListener('mouseleave', onChar
 // be added at that point without needing to know its exact km beforehand.
 document.getElementById('elevation-chart').addEventListener('click', (evt) => {
     if (!chartLayout) return;
+    if (suppressChartClick) return;
     const canvas = document.getElementById('elevation-chart');
     const rect = canvas.getBoundingClientRect();
     const x = evt.clientX - rect.left;
@@ -660,6 +695,165 @@ document.getElementById('elevation-chart').addEventListener('click', (evt) => {
     const km = Math.max(0, Math.min(totalKm, t * totalKm));
     document.getElementById('aid-distance').value = km.toFixed(2);
     document.getElementById('aid-name').focus();
+});
+
+// ---- Manual stop placement (drag & drop) -----------------------------------
+//
+// Planned stops can be dragged along the elevation chart, and spare units the
+// plan left unused (chips in the Nutrition summary) can be dropped onto it.
+// Each becomes an entry in `manualStops`, applied by the planner on top of the
+// automatic plan without moving the other stops.
+
+const stopCanvas = document.getElementById('elevation-chart');
+
+const chartKmFromClientX = (clientX) => {
+    const { totalKm, padLeft, padRight, width } = chartLayout;
+    const x = clientX - stopCanvas.getBoundingClientRect().left;
+    return Math.max(0, Math.min(totalKm, (x - padLeft) / (width - padLeft - padRight) * totalKm));
+};
+
+const newManualId = () => `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const removeManualStop = (id) => {
+    manualStops = manualStops.filter(m => m.id !== id);
+    refreshNutrition();
+};
+
+let chartRedrawQueued = false;
+const queueChartRedraw = () => {
+    if (chartRedrawQueued) return;
+    chartRedrawQueued = true;
+    requestAnimationFrame(() => {
+        chartRedrawQueued = false;
+        redrawChart();
+    });
+};
+
+const stopAtPointer = (evt) => {
+    if (activeTab !== 'nutrition' || !nutritionPlan) return null;
+    const rect = stopCanvas.getBoundingClientRect();
+    const x = evt.clientX - rect.left;
+    const y = evt.clientY - rect.top;
+    let best = null;
+    let bestDist = 10;
+    stopHitboxes.forEach(h => {
+        const d = Math.hypot(h.x - x, h.y - y);
+        if (d <= bestDist) {
+            best = h.stop;
+            bestDist = d;
+        }
+    });
+    return best;
+};
+
+stopCanvas.addEventListener('pointerdown', (evt) => {
+    if (evt.button !== 0 || !chartLayout) return;
+    const stop = stopAtPointer(evt);
+    if (!stop) return;
+    stopDrag = { stop, km: stop.distance_km, startX: evt.clientX, moved: false };
+    stopCanvas.setPointerCapture(evt.pointerId);
+    stopCanvas.style.cursor = 'grabbing';
+    evt.preventDefault();
+});
+
+stopCanvas.addEventListener('pointermove', (evt) => {
+    if (!stopDrag) {
+        stopCanvas.style.cursor = stopAtPointer(evt) ? 'grab' : '';
+        return;
+    }
+    if (Math.abs(evt.clientX - stopDrag.startX) > 3) stopDrag.moved = true;
+    if (!stopDrag.moved) return;
+    stopDrag.km = chartKmFromClientX(evt.clientX);
+    queueChartRedraw();
+});
+
+const endStopDrag = (commit) => {
+    if (!stopDrag) return;
+    const { stop, km, moved } = stopDrag;
+    stopDrag = null;
+    stopCanvas.style.cursor = '';
+    if (moved) {
+        suppressChartClick = true;
+        setTimeout(() => { suppressChartClick = false; }, 0);
+    }
+    if (!commit || !moved) {
+        redrawChart();
+        return;
+    }
+    const existing = stop.manual_id && manualStops.find(m => m.id === stop.manual_id);
+    if (existing) {
+        existing.distance_km = km;
+    } else {
+        manualStops.push({
+            id: newManualId(),
+            productId: nutritionProducts[stop.product_index].id,
+            occurrence: stop.occurrence ?? null,
+            distance_km: km,
+        });
+    }
+    refreshNutrition();
+};
+
+stopCanvas.addEventListener('pointerup', () => endStopDrag(true));
+stopCanvas.addEventListener('pointercancel', () => endStopDrag(false));
+document.addEventListener('keydown', (evt) => {
+    if (evt.key === 'Escape') endStopDrag(false);
+});
+
+// Double-click a hand-placed stop to hand it back to the planner.
+stopCanvas.addEventListener('dblclick', (evt) => {
+    const stop = stopAtPointer(evt);
+    if (stop && stop.manual_id) removeManualStop(stop.manual_id);
+});
+
+// Spare chips: HTML5 drag from the Nutrition summary onto the chart.
+nutritionContainer.addEventListener('dragstart', (evt) => {
+    const chip = evt.target.closest && evt.target.closest('.spare-chip');
+    if (!chip) return;
+    draggedSpare = { productId: chip.dataset.productId, kind: chip.dataset.kind };
+    evt.dataTransfer.effectAllowed = 'copy';
+    evt.dataTransfer.setData('text/plain', chip.dataset.productId);
+});
+
+nutritionContainer.addEventListener('dragend', () => {
+    draggedSpare = null;
+    dropPreview = null;
+    redrawChart();
+});
+
+stopCanvas.addEventListener('dragover', (evt) => {
+    if (!draggedSpare || !chartLayout) return;
+    evt.preventDefault();
+    evt.dataTransfer.dropEffect = 'copy';
+    dropPreview = { kind: draggedSpare.kind, km: chartKmFromClientX(evt.clientX) };
+    onChartHover(evt);
+    queueChartRedraw();
+});
+
+stopCanvas.addEventListener('dragleave', () => {
+    dropPreview = null;
+    onChartHoverEnd();
+    queueChartRedraw();
+});
+
+stopCanvas.addEventListener('drop', (evt) => {
+    if (!draggedSpare || !chartLayout) return;
+    evt.preventDefault();
+    manualStops.push({
+        id: newManualId(),
+        productId: draggedSpare.productId,
+        occurrence: null,
+        distance_km: chartKmFromClientX(evt.clientX),
+    });
+    draggedSpare = null;
+    dropPreview = null;
+    onChartHoverEnd();
+    refreshNutrition();
+});
+
+nutritionContainer.addEventListener('click', (evt) => {
+    const btn = evt.target.closest('.stop-reset-btn');
+    if (btn) removeManualStop(btn.dataset.manualId);
 });
 
 const updateGrid = (chunks) => {
@@ -743,6 +937,7 @@ const initAnalyzer = async () => {
         clearNutritionMarkers();
         renderNutritionResults();
         aidStations = [];
+        manualStops = [];
         renderAidStationList();
         clearAidMarkers();
         return;
@@ -764,6 +959,7 @@ const initAnalyzer = async () => {
             // Aid stations embedded in the GPX file's own <wpt> waypoints,
             // if any. Manual entries from a previous file don't carry over.
             aidStations = [];
+            manualStops = [];
             try {
                 aidStations = analyzer.get_aid_stations().map((s, i) => ({ ...s, id: `gpx-${i}`, source: 'gpx' }));
                 aidStations.sort((a, b) => a.distance_km - b.distance_km);
@@ -778,6 +974,7 @@ const initAnalyzer = async () => {
             onChartHoverEnd();
             previewSection.classList.add('hidden');
             aidStations = [];
+            manualStops = [];
             renderAidStationList();
             clearAidMarkers();
             nutritionPlan = null;
@@ -989,6 +1186,10 @@ const getNutritionSettings = () => {
         max_downhill_pct: num('max-eat-downhill', 5),
         aid_window_minutes: num('aid-window', 15),
         aid_stations: aidStations.map(({ name, distance_km }) => ({ name, distance_km })),
+        manual_stops: manualStops.flatMap(m => {
+            const product_index = nutritionProducts.findIndex(p => p.id === m.productId);
+            return product_index < 0 ? [] : [{ id: m.id, product_index, occurrence: m.occurrence, distance_km: m.distance_km }];
+        }),
         products: nutritionProducts.map(({ name, kind, carbs_g, quantity, minutes_per_unit, start_minutes }) => (
             { name, kind, carbs_g, quantity, minutes_per_unit, start_minutes }
         )),
@@ -1049,7 +1250,16 @@ const renderNutritionResults = () => {
     if (hardSlopeCount) {
         html += `<p class="nutrition-warning">${hardSlopeCount} stop(s) couldn't avoid a hard slope (&#9888;).</p>`;
     }
-    html += `${usageLines}</div>`;
+    const spareChips = plan.usage
+        .map((u, i) => ({ u, i, left: Math.floor(u.carried - u.used_units + 1e-6) }))
+        .filter(({ u, left }) => u.kind !== 'drink' && left > 0)
+        .map(({ u, i, left }) => `<span class="spare-chip" draggable="true" data-product-id="${nutritionProducts[i].id}" data-kind="${u.kind}"><span class="stop-dot nutrition-stop-${u.kind}"></span>${escapeHtml(u.name)} &times;${left}</span>`)
+        .join('');
+    html += usageLines;
+    if (spareChips) {
+        html += `<p class="spare-row">Spare: ${spareChips}</p><p class="help-text">Drag a spare onto the elevation chart to eat it there.</p>`;
+    }
+    html += '<p class="help-text">Drag a stop on the elevation chart to move it; double-click a hand-placed one to reset it.</p></div>';
     html += `<div class="nutrition-summary">
         <p><strong>Carbs over time</strong></p>
         <canvas id="carbs-chart"></canvas>
@@ -1062,7 +1272,9 @@ const renderNutritionResults = () => {
         const rows = plan.stops.map((s, i) => {
             const deltaMin = Math.round((s.time_secs - s.ideal_time_secs) / 60);
             let note = '';
-            if (s.aid_station) {
+            if (s.manual_id) {
+                note = `${s.occurrence == null ? 'placed' : 'moved'} by hand <button type="button" class="stop-reset-btn" data-manual-id="${escapeHtml(s.manual_id)}" title="Hand back to the planner">&#8634;</button>`;
+            } else if (s.aid_station) {
                 note = `at ${escapeHtml(s.aid_station)}`;
                 if (Math.abs(s.time_secs - s.ideal_time_secs) >= 60) {
                     note += ` (${deltaMin > 0 ? '+' : ''}${deltaMin} min)`;
@@ -1199,7 +1411,7 @@ const renderNutritionMarkers = () => {
         el.title = stop.name;
         const grad = `${stop.gradient_pct > 0 ? '+' : ''}${stop.gradient_pct.toFixed(1)}`;
         const popup = new maplibregl.Popup({ offset: 10, closeButton: false }).setHTML(
-            `<strong>${escapeHtml(stop.name)}</strong> (${stop.carbs_g.toFixed(0)} g)<br>${stop.time} &middot; ${stop.distance_km.toFixed(2)} km &middot; ${grad}%${stop.aid_station ? `<br>at ${escapeHtml(stop.aid_station)}` : ''}`
+            `<strong>${escapeHtml(stop.name)}</strong> (${stop.carbs_g.toFixed(0)} g)<br>${stop.time} &middot; ${stop.distance_km.toFixed(2)} km &middot; ${grad}%${stop.aid_station ? `<br>at ${escapeHtml(stop.aid_station)}` : ''}${stop.manual_id ? '<br>placed by hand' : ''}`
         );
         const marker = new maplibregl.Marker({ element: el })
             .setLngLat([point.lon, point.lat])
@@ -1329,7 +1541,8 @@ document.getElementById('product-list').addEventListener('click', (evt) => {
         if (to < 0 || to >= nutritionProducts.length) return;
         [nutritionProducts[idx], nutritionProducts[to]] = [nutritionProducts[to], nutritionProducts[idx]];
     } else {
-        nutritionProducts.splice(idx, 1);
+        const [removed] = nutritionProducts.splice(idx, 1);
+        manualStops = manualStops.filter(m => m.productId !== removed.id);
     }
     renderProductList();
     refreshNutrition();
